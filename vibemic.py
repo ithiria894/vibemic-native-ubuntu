@@ -177,10 +177,27 @@ def notify(title, message, icon="dialog-information"):
 
 
 def create_tray_icon(color):
-    """Create a simple colored circle icon for the tray."""
-    img = Image.new("RGBA", (22, 22), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([3, 3, 19, 19], fill=color)
+    """Create a tray icon: colored circle with white mic silhouette."""
+    S = 48
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    mc = (255, 255, 255, 240)
+
+    # Background circle
+    d.ellipse([0, 0, S - 1, S - 1], fill=color)
+
+    # Mic body
+    d.rounded_rectangle([17, 7, 31, 27], radius=7, fill=mc)
+
+    # Arc (cup under mic)
+    d.arc([11, 16, 37, 38], 0, 180, fill=mc, width=3)
+
+    # Stand
+    d.line([24, 37, 24, 42], fill=mc, width=3)
+
+    # Base
+    d.line([18, 42, 30, 42], fill=mc, width=3)
+
     return img
 
 
@@ -656,9 +673,9 @@ def main():
 
     # Tray icon states
     icons = {
-        "idle": create_tray_icon((100, 180, 255, 255)),       # Blue
-        "recording": create_tray_icon((255, 60, 60, 255)),    # Red
-        "transcribing": create_tray_icon((255, 180, 0, 255)), # Orange
+        "idle": create_tray_icon((80, 140, 220, 255)),        # Blue
+        "recording": create_tray_icon((220, 40, 40, 255)),    # Red
+        "transcribing": create_tray_icon((220, 160, 0, 255)), # Orange
     }
 
     tray = pystray.Icon("vibemic")
