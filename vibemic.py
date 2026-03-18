@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
 from pathlib import Path
 
 from openai import OpenAI
@@ -29,6 +31,13 @@ WHISPER_MODELS = [
     "whisper-1",
     "gpt-4o-transcribe",
     "gpt-4o-mini-transcribe",
+]
+
+CHAT_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
 ]
 
 LANGUAGES = [
@@ -54,6 +63,22 @@ LANGUAGES = [
 
 RESPONSE_FORMATS = ["json", "text", "srt", "verbose_json", "vtt"]
 
+# ─── Hotkey key-name → X11 keysym mapping ───
+KEY_NAME_TO_XK = {
+    "page_down": XK.XK_Next,
+    "page_up": XK.XK_Prior,
+    "home": XK.XK_Home,
+    "end": XK.XK_End,
+    "insert": XK.XK_Insert,
+    "delete": XK.XK_Delete,
+    "scroll_lock": XK.XK_Scroll_Lock,
+    "pause": XK.XK_Pause,
+    "print_screen": XK.XK_Print,
+    "f1": XK.XK_F1, "f2": XK.XK_F2, "f3": XK.XK_F3, "f4": XK.XK_F4,
+    "f5": XK.XK_F5, "f6": XK.XK_F6, "f7": XK.XK_F7, "f8": XK.XK_F8,
+    "f9": XK.XK_F9, "f10": XK.XK_F10, "f11": XK.XK_F11, "f12": XK.XK_F12,
+}
+
 # ─── Config management ───
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -63,6 +88,30 @@ DEFAULT_CONFIG = {
     "temperature": 0,
     "response_format": "json",
     "hotkey": "page_down",
+    "paraphrase_enabled": False,
+    "paraphrase_prompt": (
+        "Rewrite this voice transcript into natural work English for Slack or work chat.\n"
+        "\n"
+        "The input may be in Cantonese, mixed Cantonese/English, or English. Always output in English.\n"
+        "\n"
+        "Style:\n"
+        "- Reads like a real engineer typed it quickly but clearly\n"
+        "- Simple, clear, everyday work language — not corporate, not formal\n"
+        "- Write like a smart non-native English speaker in tech — natural but not overly polished\n"
+        "- Keep the original meaning and technical terms accurate\n"
+        "- Fix rough or broken language naturally — do not over-fix\n"
+        "- Same length or shorter. Do not add context that was not in the original\n"
+        "- Preserve the original intent, including uncertainty, directness, or casual tone\n"
+        "- Natural flow, slightly uneven sentences are fine\n"
+        "- No em dash\n"
+        "\n"
+        "Never use: just a quick update, for your reference, I wanted to let you know, "
+        "please let me know if you have any questions, moving forward, aligned on, "
+        "happy to, sounds good, on my side\n"
+        "\n"
+        "Return only the rewritten text. No explanation."
+    ),
+    "paraphrase_model": "gpt-4o-mini",
 }
 
 
@@ -70,7 +119,6 @@ def load_config():
     """Load config from config.json, falling back to .env for API key."""
     config = dict(DEFAULT_CONFIG)
 
-    # Try config.json first
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
@@ -79,11 +127,9 @@ def load_config():
         except (json.JSONDecodeError, OSError):
             pass
 
-    # If no API key in config.json, try .env
     if not config.get("api_key"):
         config["api_key"] = _load_env_api_key()
 
-    # Also check environment variable
     env_key = os.environ.get("OPENAI_API_KEY")
     if env_key:
         config["api_key"] = env_key
@@ -126,15 +172,17 @@ def load_history():
         return []
 
 
-def save_to_history(text):
-    """Append a transcript to history."""
+def save_to_history(text, original=None):
+    """Append a transcript to history. If paraphrased, pass original transcript too."""
     from datetime import datetime
     history = load_history()
-    history.insert(0, {
+    entry = {
         "text": text,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-    })
-    # Keep last 200 entries
+    }
+    if original and original != text:
+        entry["original"] = original
+    history.insert(0, entry)
     history = history[:200]
     try:
         with open(HISTORY_FILE, "w") as f:
@@ -184,339 +232,417 @@ def create_tray_icon(color):
     d = ImageDraw.Draw(img)
     mc = (255, 255, 255, 240)
 
-    # Background circle
     d.ellipse([0, 0, S - 1, S - 1], fill=color)
-
-    # Mic body
     d.rounded_rectangle([17, 7, 31, 27], radius=7, fill=mc)
-
-    # Arc (cup under mic)
     d.arc([11, 16, 37, 38], 0, 180, fill=mc, width=3)
-
-    # Stand
     d.line([24, 37, 24, 42], fill=mc, width=3)
-
-    # Base
     d.line([18, 42, 30, 42], fill=mc, width=3)
 
     return img
 
 
-# ─── Settings GUI (browser-based, zero extra deps) ───
-import http.server
-import urllib.parse
-import webbrowser
-import socket
+# ─── Theme constants ───
+BG = "#1a1a2e"
+FG = "#e0e0e0"
+ACCENT = "#64b5f6"
+INPUT_BG = "#16213e"
+BORDER = "#2a2a4a"
 
-SETTINGS_PORT = None  # assigned dynamically
+
+def _apply_theme(root):
+    """Apply dark theme to a tkinter root/toplevel."""
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("TLabel", background=BG, foreground=FG, font=("sans-serif", 10))
+    style.configure("TButton", background=INPUT_BG, foreground=FG,
+                    bordercolor=BORDER, relief="flat", padding=(10, 6))
+    style.map("TButton", background=[("active", "#252550")])
+    style.configure("Accent.TButton", background=ACCENT, foreground=BG,
+                    font=("sans-serif", 10, "bold"))
+    style.map("Accent.TButton", background=[("active", "#90caf9")])
+    style.configure("TEntry", fieldbackground=INPUT_BG, foreground=FG,
+                    bordercolor=BORDER, insertcolor=FG)
+    style.configure("TCombobox", fieldbackground=INPUT_BG, foreground=FG,
+                    background=INPUT_BG, selectbackground=INPUT_BG, selectforeground=ACCENT)
+    style.map("TCombobox",
+              fieldbackground=[("readonly", INPUT_BG)],
+              foreground=[("readonly", FG)],
+              selectbackground=[("readonly", INPUT_BG)])
+    style.configure("TScale", background=BG, troughcolor=INPUT_BG, slidercolor=ACCENT)
+    style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor="",
+                    indicatorcolor=INPUT_BG)
+    style.map("TCheckbutton", background=[("active", BG)],
+              indicatorcolor=[("selected", ACCENT)])
+    style.configure("TScrollbar", background=INPUT_BG, troughcolor=BG,
+                    bordercolor=BG, arrowcolor=FG)
 
 
-def _build_settings_html(cfg):
-    """Generate the settings HTML page."""
-    model_options = "".join(
-        f'<option value="{m}"{"selected" if m == cfg.get("model", "") else ""}>{m}</option>'
-        for m in WHISPER_MODELS
+def _label(parent, text, size=10, bold=False, color=None):
+    font = ("sans-serif", size, "bold" if bold else "normal")
+    return tk.Label(parent, text=text, bg=BG, fg=color or FG, font=font)
+
+
+def _text_widget(parent, height=2):
+    return tk.Text(
+        parent, height=height, bg=INPUT_BG, fg=FG,
+        insertbackground=FG, relief="flat", bd=1,
+        font=("sans-serif", 10), padx=8, pady=6,
+        wrap="word", highlightbackground=BORDER, highlightthickness=1,
     )
-    lang_options = "".join(
-        f'<option value="{code}"{"selected" if code == cfg.get("language", "") else ""}>{name}</option>'
-        for name, code in LANGUAGES
-    )
-    fmt_options = "".join(
-        f'<option value="{f}"{"selected" if f == cfg.get("response_format", "") else ""}>{f}</option>'
-        for f in RESPONSE_FORMATS
-    )
-    api_key_escaped = cfg.get("api_key", "").replace("&", "&amp;").replace('"', "&quot;")
-    prompt_escaped = cfg.get("prompt", "").replace("&", "&amp;").replace("<", "&lt;")
-    temp_val = cfg.get("temperature", 0)
-
-    return f"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<title>VibeMic Settings</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 30px; }}
-  .container {{ max-width: 520px; margin: 0 auto; }}
-  h1 {{ font-size: 22px; margin-bottom: 24px; color: #64b5f6; }}
-  label {{ display: block; font-weight: 600; margin-bottom: 4px; margin-top: 16px; font-size: 14px; }}
-  input[type=text], input[type=password], select, textarea {{
-    width: 100%; padding: 10px 12px; border: 1px solid #333; border-radius: 6px;
-    background: #16213e; color: #e0e0e0; font-size: 14px; outline: none;
-  }}
-  input:focus, select:focus, textarea:focus {{ border-color: #64b5f6; }}
-  textarea {{ resize: vertical; min-height: 60px; font-family: inherit; }}
-  .key-row {{ display: flex; gap: 8px; align-items: center; }}
-  .key-row input {{ flex: 1; }}
-  .key-row button {{ padding: 10px 14px; border: 1px solid #333; border-radius: 6px; background: #16213e; color: #aaa; cursor: pointer; font-size: 13px; }}
-  .key-row button:hover {{ background: #1a1a3e; }}
-  .slider-row {{ display: flex; align-items: center; gap: 12px; }}
-  .slider-row input[type=range] {{ flex: 1; accent-color: #64b5f6; }}
-  .slider-val {{ min-width: 32px; text-align: center; font-weight: 600; }}
-  .btn-row {{ margin-top: 28px; text-align: right; }}
-  .btn {{ padding: 10px 24px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 600; }}
-  .btn-save {{ background: #64b5f6; color: #1a1a2e; }}
-  .btn-save:hover {{ background: #90caf9; }}
-  .msg {{ margin-top: 16px; padding: 12px; border-radius: 6px; display: none; font-size: 14px; }}
-  .msg.ok {{ display: block; background: #1b5e20; color: #a5d6a7; }}
-  .msg.err {{ display: block; background: #b71c1c; color: #ef9a9a; }}
-  .hint {{ font-size: 12px; color: #888; margin-top: 2px; }}
-</style>
-</head><body>
-<div class="container">
-  <h1>VibeMic Settings</h1>
-  <form id="f">
-    <label>OpenAI API Key</label>
-    <div class="key-row">
-      <input type="password" id="api_key" name="api_key" value="{api_key_escaped}" placeholder="sk-...">
-      <button type="button" onclick="let e=document.getElementById('api_key');e.type=e.type==='password'?'text':'password';this.textContent=e.type==='password'?'Show':'Hide'">Show</button>
-    </div>
-
-    <label>Model</label>
-    <select name="model">{model_options}</select>
-
-    <label>Language</label>
-    <select name="language">{lang_options}</select>
-
-    <label>Prompt <span class="hint">(hint for Whisper — e.g. expected languages)</span></label>
-    <textarea name="prompt" rows="2">{prompt_escaped}</textarea>
-
-    <label>Temperature</label>
-    <div class="slider-row">
-      <input type="range" name="temperature" min="0" max="1" step="0.1" value="{temp_val}"
-             oninput="document.getElementById('tv').textContent=this.value">
-      <span class="slider-val" id="tv">{temp_val}</span>
-    </div>
-
-    <label>Response Format</label>
-    <select name="response_format">{fmt_options}</select>
-
-    <div class="btn-row">
-      <button type="submit" class="btn btn-save">Save</button>
-    </div>
-  </form>
-  <div id="msg" class="msg"></div>
-</div>
-<script>
-document.getElementById('f').addEventListener('submit', async (e) => {{
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const data = Object.fromEntries(fd.entries());
-  data.temperature = parseFloat(data.temperature);
-  const msg = document.getElementById('msg');
-  try {{
-    const r = await fetch('/save', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(data)}});
-    if (r.ok) {{
-      msg.className = 'msg ok'; msg.textContent = 'Settings saved!';
-    }} else {{
-      msg.className = 'msg err'; msg.textContent = 'Save failed: ' + (await r.text());
-    }}
-  }} catch(ex) {{
-    msg.className = 'msg err'; msg.textContent = 'Connection error.';
-  }}
-}});
-</script>
-</body></html>"""
 
 
-def _build_history_html():
-    """Generate the history HTML page."""
-    history = load_history()
-    if not history:
-        entries_html = '<p class="empty">No transcripts yet. Press PgDn to record!</p>'
-    else:
-        rows = []
-        for i, entry in enumerate(history):
-            text = entry.get("text", "")
-            ts = entry.get("timestamp", "")
-            text_escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
-            text_json = json.dumps(text)
-            rows.append(f"""
-            <div class="entry" id="entry-{i}">
-              <div class="entry-header">
-                <span class="ts">{ts}</span>
-                <span class="actions">
-                  <button class="btn-copy" onclick='doCopy({text_json}, this)'>Copy</button>
-                  <button class="btn-del" onclick="doDelete({i})">Delete</button>
-                </span>
-              </div>
-              <div class="entry-text">{text_escaped}</div>
-            </div>""")
-        entries_html = "\n".join(rows)
+# ─── Native Settings Dialog ───
+def open_settings_dialog(on_save=None, on_hotkey_change=None):
+    """Open native tkinter settings window."""
+    def run():
+        cfg = load_config()
 
-    return f"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<title>VibeMic History</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 30px; }}
-  .container {{ max-width: 680px; margin: 0 auto; }}
-  .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
-  h1 {{ font-size: 22px; color: #64b5f6; }}
-  .header-actions {{ display: flex; gap: 8px; }}
-  .btn-settings, .btn-clear {{ padding: 8px 16px; border: 1px solid #333; border-radius: 6px;
-    background: #16213e; color: #aaa; cursor: pointer; font-size: 13px; text-decoration: none; }}
-  .btn-settings:hover {{ background: #1a1a3e; color: #e0e0e0; }}
-  .btn-clear {{ color: #ef9a9a; border-color: #5a2020; }}
-  .btn-clear:hover {{ background: #3a1010; }}
-  .count {{ font-size: 13px; color: #888; margin-bottom: 16px; }}
-  .entry {{ background: #16213e; border: 1px solid #2a2a4a; border-radius: 8px; padding: 14px; margin-bottom: 10px; }}
-  .entry-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }}
-  .ts {{ font-size: 12px; color: #888; }}
-  .actions {{ display: flex; gap: 6px; }}
-  .btn-copy, .btn-del {{ padding: 4px 12px; border: 1px solid #333; border-radius: 4px;
-    background: #1a1a2e; color: #aaa; cursor: pointer; font-size: 12px; }}
-  .btn-copy:hover {{ background: #1b3a5e; color: #64b5f6; border-color: #64b5f6; }}
-  .btn-del:hover {{ background: #3a1010; color: #ef9a9a; border-color: #ef9a9a; }}
-  .btn-copied {{ background: #1b5e20 !important; color: #a5d6a7 !important; border-color: #2e7d32 !important; }}
-  .entry-text {{ font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }}
-  .empty {{ color: #888; font-size: 15px; text-align: center; padding: 40px; }}
-</style>
-</head><body>
-<div class="container">
-  <div class="header">
-    <h1>VibeMic History</h1>
-    <div class="header-actions">
-      <a href="/" class="btn-settings">Settings</a>
-      <button class="btn-clear" onclick="doClear()">Clear All</button>
-    </div>
-  </div>
-  <div class="count">{len(history)} transcript{"s" if len(history) != 1 else ""}</div>
-  <div id="entries">{entries_html}</div>
-</div>
-<script>
-async function doCopy(text, btn) {{
-  try {{
-    await navigator.clipboard.writeText(text);
-  }} catch(e) {{
-    const ta = document.createElement('textarea');
-    ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
-    document.body.appendChild(ta); ta.select(); document.execCommand('copy');
-    document.body.removeChild(ta);
-  }}
-  btn.textContent = 'Copied!';
-  btn.classList.add('btn-copied');
-  setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('btn-copied'); }}, 1500);
-}}
+        root = tk.Tk()
+        root.title("VibeMic Settings")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+        _apply_theme(root)
 
-async function doDelete(index) {{
-  const r = await fetch('/history/delete', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{index: index}})
-  }});
-  if (r.ok) {{
-    document.getElementById('entry-' + index).style.display = 'none';
-  }}
-}}
+        # ── Scrollable canvas wrapper ──
+        outer = tk.Frame(root, bg=BG)
+        outer.pack(fill="both", expand=True)
 
-async function doClear() {{
-  if (!confirm('Clear all transcript history?')) return;
-  const r = await fetch('/history/clear', {{method: 'POST'}});
-  if (r.ok) location.reload();
-}}
-</script>
-</body></html>"""
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, width=500)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
 
+        frame = tk.Frame(canvas, bg=BG, padx=24, pady=20)
+        win_id = canvas.create_window((0, 0), window=frame, anchor="nw")
 
-class _SettingsHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP handler for settings + history pages."""
+        def on_frame_configure(_):
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
-    on_save_callback = None
+        def on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
 
-    def log_message(self, *args):
-        pass  # suppress logs
+        frame.bind("<Configure>", on_frame_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
 
-    def do_GET(self):
-        if self.path.startswith("/history"):
-            html = _build_history_html()
-        else:
-            cfg = load_config()
-            html = _build_settings_html(cfg)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode())
+        def mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
+        canvas.bind_all("<MouseWheel>", mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
-        if self.path == "/save":
-            try:
-                data = json.loads(body)
-            except (json.JSONDecodeError, ValueError):
-                self.send_error(400, "Invalid JSON")
+        # ── Title ──
+        _label(frame, "VibeMic Settings", size=16, bold=True, color=ACCENT).pack(anchor="w", pady=(0, 16))
+
+        def section(text):
+            _label(frame, text, size=10, bold=True).pack(anchor="w", pady=(12, 2))
+
+        def hint(text):
+            tk.Label(frame, text=text, bg=BG, fg="#888888",
+                     font=("sans-serif", 9)).pack(anchor="w")
+
+        def divider():
+            tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(16, 4))
+
+        # ── API Key ──
+        section("OpenAI API Key")
+        key_frame = tk.Frame(frame, bg=BG)
+        key_frame.pack(fill="x")
+        api_var = tk.StringVar(value=cfg.get("api_key", ""))
+        api_entry = ttk.Entry(key_frame, textvariable=api_var, show="•", width=44)
+        api_entry.pack(side="left", fill="x", expand=True)
+
+        def toggle_key():
+            api_entry.config(show="" if api_entry.cget("show") else "•")
+
+        ttk.Button(key_frame, text="Show", command=toggle_key).pack(side="left", padx=(6, 0))
+
+        # ── Transcription Model ──
+        section("Transcription Model")
+        model_var = tk.StringVar(value=cfg.get("model", "gpt-4o-transcribe"))
+        ttk.Combobox(frame, textvariable=model_var, values=WHISPER_MODELS,
+                     state="readonly", width=42).pack(fill="x")
+
+        # ── Language ──
+        section("Language")
+        lang_names = [name for name, _ in LANGUAGES]
+        lang_codes = [code for _, code in LANGUAGES]
+        cur_code = cfg.get("language", "")
+        cur_idx = lang_codes.index(cur_code) if cur_code in lang_codes else 0
+        lang_var = tk.StringVar(value=lang_names[cur_idx])
+        ttk.Combobox(frame, textvariable=lang_var, values=lang_names,
+                     state="readonly", width=42).pack(fill="x")
+
+        # ── Transcription Prompt ──
+        section("Transcription Prompt")
+        hint("Hint for Whisper — expected languages or vocabulary")
+        prompt_text = _text_widget(frame, height=2)
+        prompt_text.insert("1.0", cfg.get("prompt", ""))
+        prompt_text.pack(fill="x", pady=(2, 0))
+
+        # ── Temperature ──
+        section("Temperature")
+        temp_frame = tk.Frame(frame, bg=BG)
+        temp_frame.pack(fill="x")
+        temp_var = tk.DoubleVar(value=cfg.get("temperature", 0))
+        temp_val_label = tk.Label(temp_frame, text=f"{temp_var.get():.1f}",
+                                   bg=BG, fg=ACCENT, font=("sans-serif", 10, "bold"), width=4)
+        temp_val_label.pack(side="right")
+
+        def on_temp(v):
+            temp_val_label.config(text=f"{float(v):.1f}")
+
+        ttk.Scale(temp_frame, from_=0, to=1, variable=temp_var,
+                  command=on_temp, orient="horizontal").pack(side="left", fill="x", expand=True)
+
+        # ── Response Format ──
+        section("Response Format")
+        fmt_var = tk.StringVar(value=cfg.get("response_format", "json"))
+        ttk.Combobox(frame, textvariable=fmt_var, values=RESPONSE_FORMATS,
+                     state="readonly", width=42).pack(fill="x")
+
+        # ── Hotkey ──
+        section("Record Hotkey")
+        hint("Click 'Change', then press any special key (PgDn, F-key, Home, etc.)")
+        hotkey_frame = tk.Frame(frame, bg=BG)
+        hotkey_frame.pack(fill="x", pady=(2, 0))
+        hotkey_var = tk.StringVar(value=cfg.get("hotkey", "page_down"))
+        hotkey_display = ttk.Entry(hotkey_frame, textvariable=hotkey_var,
+                                   state="readonly", width=20)
+        hotkey_display.pack(side="left")
+        capturing = [False]
+        capture_listener = [None]
+
+        def start_capture():
+            if capturing[0]:
                 return
+            capturing[0] = True
+            change_btn.config(text="Press a key...", state="disabled")
 
-            api_key = data.get("api_key", "").strip()
+            def on_key(key):
+                if not capturing[0]:
+                    return False
+                try:
+                    key_name = key.name  # special key e.g. "page_down", "f9"
+                except AttributeError:
+                    key_name = None
+                if key_name and key_name in KEY_NAME_TO_XK:
+                    hotkey_var.set(key_name)
+                    root.after(0, lambda: change_btn.config(text="Change", state="normal"))
+                    capturing[0] = False
+                    return False
+                # ignore non-special or unsupported keys, keep listening
+                return None
+
+            kl = keyboard.Listener(on_press=on_key)
+            kl.daemon = True
+            kl.start()
+            capture_listener[0] = kl
+
+        change_btn = ttk.Button(hotkey_frame, text="Change", command=start_capture)
+        change_btn.pack(side="left", padx=(8, 0))
+
+        # ══ Paraphrase Section ══
+        divider()
+        _label(frame, "Paraphrase", size=13, bold=True, color=ACCENT).pack(anchor="w", pady=(4, 0))
+        hint("After transcription, rewrite text with an AI prompt before typing")
+
+        para_enabled_var = tk.BooleanVar(value=cfg.get("paraphrase_enabled", False))
+        ttk.Checkbutton(frame, text="Enable paraphrase mode",
+                        variable=para_enabled_var).pack(anchor="w", pady=(8, 0))
+
+        section("Paraphrase Prompt")
+        hint("Instructions for how to rewrite the transcript")
+        para_prompt_text = _text_widget(frame, height=4)
+        para_prompt_text.insert("1.0", cfg.get("paraphrase_prompt", DEFAULT_CONFIG["paraphrase_prompt"]))
+        para_prompt_text.pack(fill="x", pady=(2, 0))
+
+        section("Paraphrase Model")
+        para_model_var = tk.StringVar(value=cfg.get("paraphrase_model", "gpt-4o-mini"))
+        ttk.Combobox(frame, textvariable=para_model_var, values=CHAT_MODELS,
+                     state="readonly", width=42).pack(fill="x")
+
+        # ── Buttons ──
+        tk.Frame(frame, bg=BG, height=12).pack()
+        btn_frame = tk.Frame(frame, bg=BG)
+        btn_frame.pack(fill="x", pady=(0, 4))
+
+        def do_save():
+            api_key = api_var.get().strip()
             if not api_key:
-                self.send_error(400, "API Key is required")
+                messagebox.showerror("VibeMic", "API Key is required.", parent=root)
                 return
 
-            new_config = {
+            lang_name = lang_var.get()
+            lang_code = next((c for n, c in LANGUAGES if n == lang_name), "")
+
+            new_cfg = {
                 "api_key": api_key,
-                "model": data.get("model", "whisper-1"),
-                "language": data.get("language", ""),
-                "prompt": data.get("prompt", "").strip(),
-                "temperature": round(float(data.get("temperature", 0)), 1),
-                "response_format": data.get("response_format", "json"),
-                "hotkey": "page_down",
+                "model": model_var.get(),
+                "language": lang_code,
+                "prompt": prompt_text.get("1.0", "end-1c").strip(),
+                "temperature": round(temp_var.get(), 1),
+                "response_format": fmt_var.get(),
+                "hotkey": hotkey_var.get(),
+                "paraphrase_enabled": para_enabled_var.get(),
+                "paraphrase_prompt": para_prompt_text.get("1.0", "end-1c").strip(),
+                "paraphrase_model": para_model_var.get(),
             }
-            save_config(new_config)
-            if self.on_save_callback:
-                self.on_save_callback(new_config)
+            save_config(new_cfg)
+            if on_save:
+                on_save(new_cfg)
+            if on_hotkey_change:
+                on_hotkey_change(new_cfg["hotkey"])
             notify("VibeMic", "Settings saved!")
-            self._ok()
+            root.destroy()
 
-        elif self.path == "/history/delete":
-            try:
-                data = json.loads(body)
-                delete_history_entry(int(data["index"]))
-            except (json.JSONDecodeError, ValueError, KeyError):
-                self.send_error(400)
+        ttk.Button(btn_frame, text="Cancel", command=root.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_frame, text="Save", command=do_save, style="Accent.TButton").pack(side="right")
+
+        # Set a reasonable max height
+        root.update_idletasks()
+        screen_h = root.winfo_screenheight()
+        win_h = min(frame.winfo_reqheight() + 40, int(screen_h * 0.85))
+        root.geometry(f"520x{win_h}")
+
+        root.mainloop()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ─── Native History Dialog ───
+def open_history_dialog():
+    """Open native tkinter history window."""
+    def run():
+        root = tk.Tk()
+        root.title("VibeMic History")
+        root.geometry("640x520")
+        root.configure(bg=BG)
+        _apply_theme(root)
+
+        # Header
+        header = tk.Frame(root, bg=BG, padx=16, pady=12)
+        header.pack(fill="x")
+        _label(header, "VibeMic History", size=15, bold=True, color=ACCENT).pack(side="left")
+
+        count_label = tk.Label(header, text="", bg=BG, fg="#888888",
+                                font=("sans-serif", 10))
+        count_label.pack(side="left", padx=(12, 0))
+
+        # Scrollable entries
+        list_outer = tk.Frame(root, bg=BG)
+        list_outer.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        canvas = tk.Canvas(list_outer, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_inner_configure(_):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
+
+        inner.bind("<Configure>", on_inner_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        card_widgets = []
+
+        def refresh():
+            for w in card_widgets:
+                w.destroy()
+            card_widgets.clear()
+            history = load_history()
+            count_label.config(text=f"{len(history)} transcript{'s' if len(history) != 1 else ''}")
+            if not history:
+                lbl = _label(inner, "No transcripts yet. Press PgDn to record!", color="#888888")
+                lbl.pack(pady=40)
+                card_widgets.append(lbl)
                 return
-            self._ok()
+            for i, entry in enumerate(history):
+                text = entry.get("text", "")
+                original = entry.get("original")
+                ts = entry.get("timestamp", "")
+                build_card(i, text, ts, original)
 
-        elif self.path == "/history/clear":
-            clear_history()
-            self._ok()
+        def build_card(i, text, ts, original=None):
+            card_bg = "#1e2d45" if original else INPUT_BG
+            card = tk.Frame(inner, bg=card_bg, padx=12, pady=10,
+                             highlightbackground=BORDER, highlightthickness=1)
+            card.pack(fill="x", pady=(0, 6))
+            card_widgets.append(card)
 
-        else:
-            self.send_error(404)
+            row = tk.Frame(card, bg=card_bg)
+            row.pack(fill="x")
 
-    def _ok(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok")
+            # Show paraphrase badge if this entry was paraphrased
+            ts_text = f"✍️ {ts}" if original else ts
+            tk.Label(row, text=ts_text, bg=card_bg, fg="#888888",
+                      font=("sans-serif", 9)).pack(side="left")
+
+            def make_delete(idx):
+                def do():
+                    delete_history_entry(idx)
+                    refresh()
+                return do
+
+            def make_copy(t):
+                def do():
+                    root.clipboard_clear()
+                    root.clipboard_append(t)
+                    root.after(3000, root.clipboard_clear)
+                return do
+
+            ttk.Button(row, text="Delete", command=make_delete(i)).pack(side="right", padx=(4, 0))
+            ttk.Button(row, text="Copy", command=make_copy(text)).pack(side="right")
+
+            # Paraphrased text (main)
+            tk.Label(card, text=text, bg=card_bg, fg=FG,
+                      font=("sans-serif", 11), justify="left",
+                      wraplength=560, anchor="w").pack(fill="x", pady=(6, 0), anchor="w")
+
+            # Original transcript (if paraphrased)
+            if original:
+                tk.Label(card, text="Original:", bg=card_bg, fg="#888888",
+                          font=("sans-serif", 9, "bold")).pack(anchor="w", pady=(8, 0))
+                tk.Label(card, text=original, bg=card_bg, fg="#aaaaaa",
+                          font=("sans-serif", 10), justify="left",
+                          wraplength=560, anchor="w").pack(fill="x", anchor="w")
+
+        def do_clear():
+            if messagebox.askyesno("Clear History", "Clear all transcript history?", parent=root):
+                clear_history()
+                refresh()
+
+        ttk.Button(header, text="Clear All", command=do_clear).pack(side="right")
+
+        refresh()
+        root.mainloop()
+
+    threading.Thread(target=run, daemon=True).start()
 
 
-def _find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-_settings_server = None
-
-
-def _ensure_server(on_save=None):
-    """Start the HTTP server if not already running."""
-    global _settings_server, SETTINGS_PORT
-    if on_save:
-        _SettingsHandler.on_save_callback = on_save
-    if _settings_server is None:
-        SETTINGS_PORT = _find_free_port()
-        _settings_server = http.server.HTTPServer(("127.0.0.1", SETTINGS_PORT), _SettingsHandler)
-        t = threading.Thread(target=_settings_server.serve_forever, daemon=True)
-        t.start()
-
-
-def open_settings(on_save):
-    """Start settings HTTP server (if not running) and open browser."""
-    _ensure_server(on_save)
-    webbrowser.open(f"http://127.0.0.1:{SETTINGS_PORT}")
+# ─── Paraphrase ───
+def paraphrase_text(text, api_key, para_prompt, model="gpt-4o-mini"):
+    """Use OpenAI chat completions to paraphrase the transcript."""
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": para_prompt},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ─── Recording & transcription ───
@@ -539,11 +665,11 @@ def start_recording(tray, update_tray):
 
     is_recording = True
     update_tray("recording")
-    notify("VibeMic", "🎤 Recording... Press PgDn to stop")
+    notify("VibeMic", "Recording... Press PgDn to stop")
 
 
 def stop_and_transcribe(tray, update_tray):
-    """Stop recording, send to Whisper, type the result."""
+    """Stop recording, send to Whisper, optionally paraphrase, type the result."""
     global recording_process, is_recording, config
 
     if not recording_process:
@@ -562,7 +688,7 @@ def stop_and_transcribe(tray, update_tray):
     recording_process = None
     is_recording = False
     update_tray("transcribing")
-    notify("VibeMic", "⏳ Transcribing...")
+    notify("VibeMic", "Transcribing...")
 
     # Validate audio
     if not TEMP_WAV.exists():
@@ -615,10 +741,23 @@ def stop_and_transcribe(tray, update_tray):
             update_tray("idle")
             return
 
-        # Save to history
-        save_to_history(text)
+        original_text = text
 
-        # Paste text into the focused window via clipboard (instant, like the Chrome extension)
+        # ── Paraphrase ──
+        if config.get("paraphrase_enabled"):
+            update_tray("paraphrasing")
+            notify("VibeMic", "Paraphrasing...")
+            try:
+                para_prompt = config.get("paraphrase_prompt", DEFAULT_CONFIG["paraphrase_prompt"])
+                para_model = config.get("paraphrase_model", "gpt-4o-mini")
+                text = paraphrase_text(text, api_key, para_prompt, para_model)
+            except Exception as e:
+                notify("VibeMic", f"Paraphrase failed, using original: {str(e)[:60]}", "dialog-warning")
+
+        # Save to history (include original transcript if paraphrased)
+        save_to_history(text, original=original_text)
+
+        # Paste via clipboard
         proc = subprocess.Popen(
             ["xclip", "-selection", "clipboard"],
             stdin=subprocess.PIPE
@@ -627,7 +766,7 @@ def stop_and_transcribe(tray, update_tray):
         import time
         time.sleep(0.05)
         subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=5)
-        notify("VibeMic", f"✅ Typed: {text[:60]}{'…' if len(text) > 60 else ''}")
+        notify("VibeMic", f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}")
         update_tray("idle")
 
     except Exception as e:
@@ -667,16 +806,15 @@ def main():
     if not config.get("api_key"):
         print("WARNING: No OpenAI API key found. Open Settings from the tray icon to set one.")
 
-    # Check sox is installed
     if not any((Path(d) / "sox").exists() for d in os.environ.get("PATH", "").split(":")):
         print("ERROR: sox not found. Install: sudo apt install sox libsox-fmt-all")
         sys.exit(1)
 
-    # Tray icon states
     icons = {
-        "idle": create_tray_icon((80, 140, 220, 255)),        # Blue
-        "recording": create_tray_icon((220, 40, 40, 255)),    # Red
-        "transcribing": create_tray_icon((220, 160, 0, 255)), # Orange
+        "idle": create_tray_icon((80, 140, 220, 255)),          # Blue
+        "recording": create_tray_icon((220, 40, 40, 255)),      # Red
+        "transcribing": create_tray_icon((220, 160, 0, 255)),   # Orange
+        "paraphrasing": create_tray_icon((140, 80, 220, 255)),  # Purple
     }
 
     tray = pystray.Icon("vibemic")
@@ -689,60 +827,101 @@ def main():
             "idle": "VibeMic — Press PgDn to record",
             "recording": "VibeMic — Recording... PgDn to stop",
             "transcribing": "VibeMic — Transcribing...",
+            "paraphrasing": "VibeMic — Paraphrasing...",
         }
         tray.title = titles.get(state, titles["idle"])
+
+    def open_history_click(icon, item):
+        open_history_dialog()
+
+    def toggle_paraphrase(icon, item):
+        global config
+        config["paraphrase_enabled"] = not config.get("paraphrase_enabled", False)
+        save_config(config)
+        state = "ON" if config["paraphrase_enabled"] else "OFF"
+        notify("VibeMic", f"Paraphrase mode {state}")
+
+    # Grab hotkey at X11 level
+    xdpy = None
+    current_keycode = [None]  # mutable so regrab can update it
+
+    def x11_grab(keycode):
+        if not xdpy:
+            return
+        try:
+            root_win = xdpy.screen().root
+            for mod_mask in [0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask]:
+                root_win.grab_key(keycode, mod_mask, False, X.GrabModeAsync, X.GrabModeAsync)
+            xdpy.flush()
+        except Exception as e:
+            print(f"Warning: X11 grab failed: {e}")
+
+    def x11_ungrab(keycode):
+        if not xdpy:
+            return
+        try:
+            root_win = xdpy.screen().root
+            for mod_mask in [0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask]:
+                root_win.ungrab_key(keycode, mod_mask)
+            xdpy.flush()
+        except Exception:
+            pass
+
+    try:
+        xdpy = xdisplay.Display()
+        initial_xk = KEY_NAME_TO_XK.get(config.get("hotkey", "page_down"), XK.XK_Next)
+        current_keycode[0] = xdpy.keysym_to_keycode(initial_xk)
+        x11_grab(current_keycode[0])
+        print(f"Hotkey '{config.get('hotkey', 'page_down')}' grabbed — key won't reach other apps.")
+    except Exception as e:
+        print(f"Warning: Could not grab hotkey at X11 level: {e}")
+        print("Hotkey may still reach focused applications.")
 
     def on_settings_save(new_config):
         global config
         config = new_config
 
-    def open_settings_click(icon, item):
-        open_settings(on_settings_save)
+    def on_hotkey_change(new_key_name):
+        global RECORD_KEY
+        new_key = getattr(keyboard.Key, new_key_name, None)
+        if new_key is None:
+            return
+        # Ungrab old, grab new at X11 level
+        if current_keycode[0] is not None:
+            x11_ungrab(current_keycode[0])
+        new_xk = KEY_NAME_TO_XK.get(new_key_name)
+        if new_xk and xdpy:
+            new_kc = xdpy.keysym_to_keycode(new_xk)
+            x11_grab(new_kc)
+            current_keycode[0] = new_kc
+        # Update pynput listener key
+        RECORD_KEY = new_key
+        print(f"Hotkey changed to '{new_key_name}'")
 
-    def open_history_click(icon, item):
-        _ensure_server(on_settings_save)
-        webbrowser.open(f"http://127.0.0.1:{SETTINGS_PORT}/history")
+    def open_settings_click(icon, item):
+        open_settings_dialog(on_settings_save, on_hotkey_change)
 
     def quit_app(icon, item):
         global recording_process
         if recording_process:
             recording_process.kill()
-        # Ungrab PgDn
-        if xdpy:
-            try:
-                root = xdpy.screen().root
-                keycode = xdpy.keysym_to_keycode(XK.XK_Next)
-                for mod_mask in [0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask]:
-                    root.ungrab_key(keycode, mod_mask)
-                xdpy.flush()
-            except Exception:
-                pass
+        if current_keycode[0] is not None:
+            x11_ungrab(current_keycode[0])
         icon.stop()
 
     tray.menu = pystray.Menu(
         pystray.MenuItem("VibeMic", None, enabled=False),
         pystray.MenuItem("📋  History", open_history_click),
         pystray.MenuItem("⚙️  Settings...", open_settings_click),
+        pystray.MenuItem(
+            "✍️  Paraphrase",
+            toggle_paraphrase,
+            checked=lambda item: config.get("paraphrase_enabled", False),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app),
     )
 
-    # Grab PgDn at X11 level so it won't reach the focused app
-    xdpy = None
-    try:
-        xdpy = xdisplay.Display()
-        root = xdpy.screen().root
-        keycode = xdpy.keysym_to_keycode(XK.XK_Next)  # PgDn
-        # Grab plain PgDn + common lock-modifier combos (NumLock=Mod2, CapsLock=Lock)
-        for mod_mask in [0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask]:
-            root.grab_key(keycode, mod_mask, True, X.GrabModeAsync, X.GrabModeAsync)
-        xdpy.flush()
-        print("PgDn grabbed — key won't reach other apps.")
-    except Exception as e:
-        print(f"Warning: Could not grab PgDn at X11 level: {e}")
-        print("PgDn may still move cursor in focused applications.")
-
-    # Global hotkey listener (pynput XRecord still sees grabbed keys)
     def on_press(key):
         if key == RECORD_KEY:
             on_hotkey(tray, update_tray)
@@ -751,9 +930,10 @@ def main():
     listener.daemon = True
     listener.start()
 
-    print("VibeMic Native running. Press PgDn to record. Tray icon active.")
+    print("VibeMic Native running. Tray icon active.")
     print(f"Config: model={config.get('model')}, language={config.get('language') or 'auto'}")
-    print(f"API key: {'✅ set' if config.get('api_key') else '❌ missing — open Settings'}")
+    print(f"API key: {'set' if config.get('api_key') else 'missing — open Settings'}")
+    print(f"Paraphrase: {'ON' if config.get('paraphrase_enabled') else 'OFF'}")
     tray.run()
 
 
