@@ -7,11 +7,14 @@ echo "=== VibeMic Native Setup ==="
 # System dependencies
 echo "Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq sox libsox-fmt-all xdotool xclip libnotify-bin python3-tk
+sudo apt-get install -y -qq sox libsox-fmt-all xdotool xclip libnotify-bin python3-tk python3-xlib
 
 # Python dependencies
 echo "Installing Python packages..."
 pip3 install --user openai pystray pynput Pillow
+
+# App directories
+mkdir -p "$HOME/.local/share/vibemic/models" "$HOME/.cache/vibemic"
 
 # Create .env if missing
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,3 +56,8 @@ echo "To find: Search 'VibeMic' in your app launcher"
 echo "Autostart: Enabled (runs on login)"
 echo ""
 echo "Usage: Press PgDn to start recording, PgDn again to stop & type."
+echo ""
+echo "Optional local transcription:"
+echo "  1. Install whisper.cpp's whisper-cli somewhere on PATH"
+echo "  2. Open Settings → Provider = Local whisper.cpp"
+echo "  3. Download a model from the new Model Library section"
