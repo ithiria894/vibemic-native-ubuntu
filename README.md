@@ -16,6 +16,8 @@ This Ubuntu version now follows the same transcription-provider direction as the
 
 It also includes a built-in **Model Library** in Settings, so each local model can be downloaded first and only then selected for use.
 
+If you are resuming this repo on another machine, read [HANDOFF_NEXT_AI.md](./HANDOFF_NEXT_AI.md) first.
+
 ## Features
 
 - **System-wide** — works in any X11 app, not just editors
