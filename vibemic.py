@@ -1272,7 +1272,6 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
 
         def toggle_provider_rows():
             selected = provider_combo.get() or provider_var.get()
-            provider_var.set(selected)
             provider = provider_spec_from_display(selected)
             is_local = provider.key == "local-whisper-cpp"
             needs_base_url = provider.key in ("litellm", "custom-openai-compatible")
@@ -1302,6 +1301,9 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
             refresh_remote_model_suggestions()
             refresh_local_model_selection()
             refresh_model_library_rows()
+
+            display = provider.display_name
+            root.after(10, lambda d=display: (provider_combo.set(d), provider_var.set(d)))
 
         provider_combo.bind("<<ComboboxSelected>>", lambda event: toggle_provider_rows())
         local_model_path_var.trace_add("write", lambda *args: refresh_local_model_selection())
