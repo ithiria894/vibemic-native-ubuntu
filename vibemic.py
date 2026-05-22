@@ -65,6 +65,7 @@ MODELS_DIR = APP_SUPPORT_DIR / "models"
 TEMP_DIR = Path.home() / ".cache" / "vibemic"
 HISTORY_FILE = SCRIPT_DIR / "history.json"
 TEMP_WAV = TEMP_DIR / "recording.wav"
+LOG_FILE = APP_SUPPORT_DIR / "vibemic.log"
 MIN_FILE_SIZE = 1000  # bytes — smaller means no real audio
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 CUSTOM_LOCAL_MODEL_TITLE = "Custom path"
@@ -72,6 +73,13 @@ CUSTOM_LOCAL_MODEL_TITLE = "Custom path"
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+import logging
+_log_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_logger = logging.getLogger("vibemic")
+_logger.setLevel(logging.DEBUG)
+_logger.addHandler(_log_handler)
 
 
 # ─── Providers & models ───
@@ -265,6 +273,8 @@ DEFAULT_CONFIG = {
     "transcription_provider": "openai",
     "transcription_base_url": "",
     "transcription_api_key": "",
+    "provider_keys": {},
+    "provider_models": {},
     "local_whisper_binary_path": detect_local_whisper_binary() or "whisper-cli",
     "local_whisper_model_path": str(LOCAL_MODEL_PRESETS[0].file_path),
     "language": "",
@@ -393,7 +403,13 @@ def resolved_transcription_base_url(config):
 
 
 def resolved_transcription_api_key(config):
-    """Provider-specific key override, falling back to the default API key."""
+    """Provider-specific key from provider_keys, falling back to legacy fields."""
+    provider = config.get("transcription_provider", "openai")
+    provider_keys = config.get("provider_keys", {})
+    if isinstance(provider_keys, dict):
+        pk = str(provider_keys.get(provider, "")).strip()
+        if pk:
+            return pk
     override = str(config.get("transcription_api_key", "")).strip()
     if override:
         return override
@@ -551,6 +567,8 @@ RECORD_KEY = getattr(keyboard.Key, config.get("hotkey", "page_down"), keyboard.K
 
 def notify(title, message, icon="dialog-information"):
     print(f"[{title}] {message}")
+    level = logging.ERROR if "error" in icon else logging.INFO
+    _logger.log(level, f"{title}: {message}")
     try:
         subprocess.Popen(
             ["notify-send", "-i", icon, title, message],
@@ -578,33 +596,44 @@ def create_tray_icon(color):
 
 
 # ─── Theme constants ───
-BG = "#1a1a2e"
-FG = "#e0e0e0"
-ACCENT = "#64b5f6"
-INPUT_BG = "#16213e"
-BORDER = "#2a2a4a"
-SUBTLE = "#888888"
-SUCCESS = "#7bd88f"
-WARNING = "#ffb86c"
-ERROR = "#ff6b6b"
+BG = "#f5f5f7"
+FG = "#1d1d1f"
+ACCENT = "#0a84ff"
+INPUT_BG = "#ffffff"
+BORDER = "#d2d2d7"
+SUBTLE = "#8e8e93"
+SUCCESS = "#30d158"
+WARNING = "#ff9f0a"
+ERROR = "#ff453a"
+CARD_BG = "#ffffff"
+SECONDARY = "#6e6e73"
 
 
 def _apply_theme(root):
-    """Apply dark theme to a tkinter root/toplevel."""
+    """Apply light macOS-like theme."""
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure("TLabel", background=BG, foreground=FG, font=("sans-serif", 10))
     style.configure(
         "TButton",
-        background=INPUT_BG,
+        background="#e8e8ed",
         foreground=FG,
         bordercolor=BORDER,
         relief="flat",
         padding=(10, 6),
+        font=("sans-serif", 10),
     )
-    style.map("TButton", background=[("active", "#252550")])
-    style.configure("Accent.TButton", background=ACCENT, foreground=BG, bordercolor=ACCENT, relief="flat", padding=(10, 6))
-    style.map("Accent.TButton", background=[("active", "#90caf9")])
+    style.map("TButton", background=[("active", "#d1d1d6")])
+    style.configure(
+        "Accent.TButton",
+        background=ACCENT,
+        foreground="#ffffff",
+        bordercolor=ACCENT,
+        relief="flat",
+        padding=(10, 6),
+        font=("sans-serif", 10, "bold"),
+    )
+    style.map("Accent.TButton", background=[("active", "#0064d2")])
     style.configure(
         "TEntry",
         fieldbackground=INPUT_BG,
@@ -617,8 +646,8 @@ def _apply_theme(root):
         fieldbackground=INPUT_BG,
         foreground=FG,
         background=INPUT_BG,
-        selectbackground=INPUT_BG,
-        selectforeground=ACCENT,
+        selectbackground=ACCENT,
+        selectforeground="#ffffff",
     )
     style.map(
         "TCombobox",
@@ -626,10 +655,10 @@ def _apply_theme(root):
         foreground=[("readonly", FG)],
         selectbackground=[("readonly", INPUT_BG)],
     )
-    style.configure("TScale", background=BG, troughcolor=INPUT_BG, slidercolor=ACCENT)
-    style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor="", indicatorcolor=INPUT_BG)
+    style.configure("TScale", background=BG, troughcolor="#e5e5ea", slidercolor=ACCENT)
+    style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor="", indicatorcolor="#e5e5ea")
     style.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
-    style.configure("TScrollbar", background=INPUT_BG, troughcolor=BG, bordercolor=BG, arrowcolor=FG)
+    style.configure("TScrollbar", background="#e5e5ea", troughcolor=BG, bordercolor=BG, arrowcolor=SUBTLE)
 
 
 def _label(parent, text, size=10, bold=False, color=None):
@@ -823,29 +852,48 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         canvas.bind_all("<Button-4>", lambda event: canvas.yview_scroll(-1, "units"))
         canvas.bind_all("<Button-5>", lambda event: canvas.yview_scroll(1, "units"))
 
-        _label(frame, "VibeMic Settings", size=16, bold=True, color=ACCENT).pack(anchor="w", pady=(0, 16))
+        title_frame = tk.Frame(frame, bg=BG)
+        title_frame.pack(fill="x", pady=(0, 8))
+        tk.Label(title_frame, text="Settings", bg=BG, fg=FG, font=("sans-serif", 18, "bold")).pack(side="left")
+        tk.Label(title_frame, text="VibeMic", bg=BG, fg=SUBTLE, font=("sans-serif", 12)).pack(side="left", padx=(8, 0), pady=(6, 0))
 
-        def make_block(title, hint_text=None):
-            block = tk.Frame(frame, bg=BG)
-            block.pack(fill="x", pady=(12, 0))
-            _label(block, title, size=10, bold=True).pack(anchor="w")
+        current_card = [None]
+
+        def make_card(title):
+            if current_card[0]:
+                current_card[0].pack(fill="x", pady=(0, 12))
+            card = tk.Frame(frame, bg=CARD_BG, bd=0, highlightthickness=1, highlightbackground=BORDER, padx=20, pady=16)
+            tk.Label(card, text=title, bg=CARD_BG, fg=FG, font=("sans-serif", 12, "bold")).pack(anchor="w", pady=(0, 12))
+            tk.Frame(card, bg=BORDER, height=1).pack(fill="x", pady=(0, 8))
+            current_card[0] = card
+            return card
+
+        def make_block(title, hint_text=None, parent=None):
+            container = parent or current_card[0] or frame
+            bg = CARD_BG if container != frame else BG
+            block = tk.Frame(container, bg=bg)
+            block.pack(fill="x", pady=(8, 0))
+            tk.Label(block, text=title, bg=bg, fg=SECONDARY, font=("sans-serif", 9, "bold")).pack(anchor="w")
             if hint_text:
                 tk.Label(
                     block,
                     text=hint_text,
-                    bg=BG,
+                    bg=bg,
                     fg=SUBTLE,
-                    font=("sans-serif", 9),
+                    font=("sans-serif", 8),
                     justify="left",
-                    wraplength=560,
-                ).pack(anchor="w", pady=(2, 0))
+                    wraplength=520,
+                ).pack(anchor="w", pady=(1, 0))
             return block
 
         def divider():
-            tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(18, 6))
+            container = current_card[0] or frame
+            bg = CARD_BG if container != frame else BG
+            tk.Frame(container, bg=BORDER, height=1).pack(fill="x", pady=(12, 4))
 
         def make_entry_row(parent, text_var, show=None, width=44):
-            row = tk.Frame(parent, bg=BG)
+            bg = CARD_BG if parent.cget("bg") == CARD_BG else BG
+            row = tk.Frame(parent, bg=bg)
             row.pack(fill="x", pady=(4, 0))
             entry = ttk.Entry(row, textvariable=text_var, show=show, width=width)
             entry.pack(side="left", fill="x", expand=True)
@@ -854,10 +902,18 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         def toggle_mask(entry_widget):
             entry_widget.config(show="" if entry_widget.cget("show") else "•")
 
-        api_var = tk.StringVar(value=cfg.get("api_key", ""))
-        provider_var = tk.StringVar(value=provider_spec_for_config(cfg).display_name)
-        model_var = tk.StringVar(value=cfg.get("model", "gpt-4o-transcribe"))
-        trans_api_var = tk.StringVar(value=cfg.get("transcription_api_key", ""))
+        saved_provider_keys = dict(cfg.get("provider_keys", {}))
+        saved_provider_models = dict(cfg.get("provider_models", {}))
+        current_provider_spec = provider_spec_for_config(cfg)
+        if current_provider_spec.key not in saved_provider_keys:
+            saved_provider_keys[current_provider_spec.key] = resolved_transcription_api_key(cfg)
+        if current_provider_spec.key not in saved_provider_models:
+            saved_provider_models[current_provider_spec.key] = cfg.get("model", "gpt-4o-transcribe")
+        prev_provider_key = [current_provider_spec.key]
+
+        api_var = tk.StringVar(value=saved_provider_keys.get(current_provider_spec.key, ""))
+        provider_var = tk.StringVar(value=current_provider_spec.display_name)
+        model_var = tk.StringVar(value=saved_provider_models.get(current_provider_spec.key, cfg.get("model", "gpt-4o-transcribe")))
         base_url_var = tk.StringVar(value=cfg.get("transcription_base_url", ""))
         local_binary_var = tk.StringVar(value=cfg.get("local_whisper_binary_path", detect_local_whisper_binary() or "whisper-cli"))
         local_model_path_var = tk.StringVar(value=resolved_local_whisper_model_path(cfg))
@@ -891,11 +947,8 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
             }
             label_widget.config(fg=colors.get(status_kind, FG))
 
-        api_block = make_block("Default API Key", "Used for remote transcription fallback and for paraphrase mode.")
-        api_row, api_entry = make_entry_row(api_block, api_var, show="•")
-        ttk.Button(api_row, text="Show", command=lambda: toggle_mask(api_entry)).pack(side="left", padx=(6, 0))
-
-        provider_block = make_block("Transcription Provider")
+        make_card("Transcription")
+        provider_block = make_block("Provider")
         provider_combo = ttk.Combobox(
             provider_block,
             textvariable=provider_var,
@@ -905,20 +958,20 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         )
         provider_combo.pack(fill="x", pady=(4, 0))
 
-        rows["remote_model"] = make_block("Remote Model")
+        rows["api_key"] = make_block("API key", "Your OpenAI / Groq / LiteLLM key. Also used by Paraphrase.")
+        api_row, api_entry = make_entry_row(rows["api_key"], api_var, show="•")
+        ttk.Button(api_row, text="Show", command=lambda: toggle_mask(api_entry)).pack(side="left", padx=(6, 0))
+
+        rows["remote_model"] = make_block("Model")
         model_combo = ttk.Combobox(rows["remote_model"], textvariable=model_var, values=[], width=42)
         model_combo.pack(fill="x", pady=(4, 0))
-        remote_model_hint = tk.Label(rows["remote_model"], textvariable=remote_model_hint_var, bg=BG, fg=SUBTLE, font=("sans-serif", 9), justify="left")
+        remote_model_hint = tk.Label(rows["remote_model"], textvariable=remote_model_hint_var, bg=CARD_BG, fg=SUBTLE, font=("sans-serif", 8), justify="left")
         remote_model_hint.pack(anchor="w", pady=(4, 0))
 
-        rows["transcription_api_key"] = make_block("Transcription API Key", "Optional override for the selected provider. Leave blank to use Default API Key.")
-        trans_api_row, trans_api_entry = make_entry_row(rows["transcription_api_key"], trans_api_var, show="•")
-        ttk.Button(trans_api_row, text="Show", command=lambda: toggle_mask(trans_api_entry)).pack(side="left", padx=(6, 0))
-
-        rows["transcription_base_url"] = make_block("Base URL")
+        rows["transcription_base_url"] = make_block("Base URL", "Required for custom endpoints.")
         base_url_row, _ = make_entry_row(rows["transcription_base_url"], base_url_var)
         ttk.Button(base_url_row, text="Reset", command=lambda: base_url_var.set("")).pack(side="left", padx=(6, 0))
-        base_url_hint = tk.Label(rows["transcription_base_url"], textvariable=base_url_hint_var, bg=BG, fg=SUBTLE, font=("sans-serif", 9), justify="left")
+        base_url_hint = tk.Label(rows["transcription_base_url"], textvariable=base_url_hint_var, bg=CARD_BG, fg=SUBTLE, font=("sans-serif", 8), justify="left")
         base_url_hint.pack(anchor="w", pady=(4, 0))
 
         rows["local_binary_path"] = make_block("Local Binary Path", "Point this to `whisper-cli` from whisper.cpp.")
@@ -968,28 +1021,19 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         model_library_rows = tk.Frame(rows["model_library"], bg=BG)
         model_library_rows.pack(fill="x")
 
+        make_card("Recognition")
         rows["language"] = make_block("Language")
         ttk.Combobox(rows["language"], textvariable=lang_var, values=lang_names, state="readonly", width=42).pack(fill="x", pady=(4, 0))
 
-        rows["prompt"] = make_block("Transcription Prompt", "Hint for the speech recognizer — expected languages or vocabulary.")
+        rows["prompt"] = make_block("Vocabulary hint", "Optional. List words or languages the recognizer often gets wrong.")
         prompt_text = _text_widget(rows["prompt"], height=2)
         prompt_text.insert("1.0", cfg.get("prompt", ""))
         prompt_text.pack(fill="x", pady=(4, 0))
 
-        rows["temperature"] = make_block("Temperature")
-        temp_frame = tk.Frame(rows["temperature"], bg=BG)
-        temp_frame.pack(fill="x", pady=(4, 0))
-        temp_value_label = tk.Label(temp_frame, text=f"{temp_var.get():.1f}", bg=BG, fg=ACCENT, font=("sans-serif", 10, "bold"), width=4)
-        temp_value_label.pack(side="right")
+        # Temperature and Response Format hidden — kept at defaults (0.0, json).
+        # Power users can edit config.json directly.
 
-        def on_temp(value):
-            temp_value_label.config(text=f"{float(value):.1f}")
-
-        ttk.Scale(temp_frame, from_=0, to=1, variable=temp_var, command=on_temp, orient="horizontal").pack(side="left", fill="x", expand=True)
-
-        rows["response_format"] = make_block("Response Format")
-        ttk.Combobox(rows["response_format"], textvariable=fmt_var, values=RESPONSE_FORMATS, state="readonly", width=42).pack(fill="x", pady=(4, 0))
-
+        make_card("Preferences")
         rows["hotkey"] = make_block("Record Hotkey", "Click Change, then press a special key such as PgDn, F-key, Home, or End.")
         hotkey_frame = tk.Frame(rows["hotkey"], bg=BG)
         hotkey_frame.pack(fill="x", pady=(4, 0))
@@ -1022,26 +1066,25 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         change_btn = ttk.Button(hotkey_frame, text="Change", command=start_capture)
         change_btn.pack(side="left", padx=(8, 0))
 
-        divider()
-        _label(frame, "Paraphrase", size=13, bold=True, color=ACCENT).pack(anchor="w", pady=(4, 0))
+        make_card("Paraphrase")
         tk.Label(
-            frame,
-            text="After transcription, rewrite text with an AI prompt before typing. This still uses the Default API Key.",
-            bg=BG,
+            current_card[0],
+            text="After transcription, rewrite text with AI before typing. Uses Default API Key.",
+            bg=CARD_BG,
             fg=SUBTLE,
             font=("sans-serif", 9),
             justify="left",
-            wraplength=560,
-        ).pack(anchor="w", pady=(2, 0))
+            wraplength=520,
+        ).pack(anchor="w", pady=(0, 4))
 
-        ttk.Checkbutton(frame, text="Enable paraphrase mode", variable=para_enabled_var).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(current_card[0], text="Rewrite with AI after transcription", variable=para_enabled_var).pack(anchor="w", pady=(4, 0))
 
-        para_prompt_block = make_block("Paraphrase Prompt")
+        para_prompt_block = make_block("Rewrite instructions")
         para_prompt_text = _text_widget(para_prompt_block, height=4)
         para_prompt_text.insert("1.0", cfg.get("paraphrase_prompt", DEFAULT_CONFIG["paraphrase_prompt"]))
         para_prompt_text.pack(fill="x", pady=(4, 0))
 
-        para_model_block = make_block("Paraphrase Model")
+        para_model_block = make_block("AI model", "Uses the same API key as transcription.")
         ttk.Combobox(para_model_block, textvariable=para_model_var, values=CHAT_MODELS, state="readonly", width=42).pack(fill="x", pady=(4, 0))
 
         def refresh_remote_model_suggestions():
@@ -1230,16 +1273,29 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         def toggle_provider_rows():
             provider = provider_spec_from_display(provider_var.get())
             is_local = provider.key == "local-whisper-cpp"
+            needs_base_url = provider.key in ("litellm", "custom-openai-compatible")
             local_keys = ["local_binary_path", "local_model_preset", "local_model_path", "model_library"]
-            remote_keys = ["remote_model", "transcription_api_key", "transcription_base_url"]
+            remote_keys = ["api_key", "remote_model", "transcription_base_url"]
+
+            old_key = prev_provider_key[0]
+            if old_key != provider.key:
+                saved_provider_keys[old_key] = api_var.get().strip()
+                saved_provider_models[old_key] = model_var.get().strip()
+                api_var.set(saved_provider_keys.get(provider.key, ""))
+                model_var.set(saved_provider_models.get(provider.key, ""))
+                prev_provider_key[0] = provider.key
 
             for key in local_keys + remote_keys:
-                rows[key].pack_forget()
+                if key in rows:
+                    rows[key].pack_forget()
 
             if is_local:
                 place_rows_in_order(local_keys, provider_block)
             else:
-                place_rows_in_order(remote_keys, provider_block)
+                visible = ["api_key", "remote_model"]
+                if needs_base_url:
+                    visible.append("transcription_base_url")
+                place_rows_in_order(visible, provider_block)
 
             refresh_remote_model_suggestions()
             refresh_local_model_selection()
@@ -1260,8 +1316,12 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         toggle_provider_rows()
 
         tk.Frame(frame, bg=BG, height=12).pack()
+        if current_card[0]:
+            current_card[0].pack(fill="x", pady=(0, 12))
+            current_card[0] = None
+
         button_row = tk.Frame(frame, bg=BG)
-        button_row.pack(fill="x", pady=(8, 4))
+        button_row.pack(fill="x", pady=(16, 4))
 
         def do_save():
             provider = provider_spec_from_display(provider_var.get())
@@ -1273,12 +1333,17 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
                 suggestions = list(provider.suggested_remote_models)
                 model_name = suggestions[0] if suggestions else DEFAULT_CONFIG["model"]
 
+            saved_provider_keys[provider.key] = api_var.get().strip()
+            saved_provider_models[provider.key] = model_name or cfg.get("model", DEFAULT_CONFIG["model"])
+
             new_cfg = {
                 "api_key": api_var.get().strip(),
                 "model": model_name or cfg.get("model", DEFAULT_CONFIG["model"]),
                 "transcription_provider": provider.key,
                 "transcription_base_url": base_url_var.get().strip(),
-                "transcription_api_key": trans_api_var.get().strip(),
+                "transcription_api_key": "",
+                "provider_keys": dict(saved_provider_keys),
+                "provider_models": dict(saved_provider_models),
                 "local_whisper_binary_path": local_binary_var.get().strip(),
                 "local_whisper_model_path": local_model_path_var.get().strip(),
                 "language": language_code,
@@ -1836,13 +1901,6 @@ def main():
     tray.icon = icons["idle"]
     tray.title = f"VibeMic — Press {_humanize_hotkey(config.get('hotkey', 'page_down'))} to record"
 
-    overlay_holder = {}
-
-    def stop_from_overlay():
-        on_hotkey(tray, update_tray)
-
-    overlay_holder["overlay"] = FloatingOverlay(stop_from_overlay)
-
     def update_tray(state):
         global current_state
         current_state = state
@@ -1855,16 +1913,6 @@ def main():
             "paraphrasing": "VibeMic — Paraphrasing...",
         }
         tray.title = titles.get(state, titles["idle"])
-        overlay = overlay_holder.get("overlay")
-        if overlay:
-            if state == "recording":
-                overlay.show_recording()
-            elif state == "transcribing":
-                overlay.show_status("Transcribing", "#ff9f0a")
-            elif state == "paraphrasing":
-                overlay.show_status("Paraphrasing", "#8e6cff")
-            else:
-                overlay.hide()
         try:
             tray.update_menu()
         except Exception:
@@ -1974,9 +2022,6 @@ def main():
             recording_process.kill()
         if current_keycode[0] is not None:
             x11_ungrab(current_keycode[0])
-        overlay = overlay_holder.get("overlay")
-        if overlay:
-            overlay.shutdown()
         icon.stop()
 
     tray.menu = pystray.Menu(
