@@ -1030,8 +1030,8 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         prompt_text.insert("1.0", cfg.get("prompt", ""))
         prompt_text.pack(fill="x", pady=(4, 0))
 
-        # Temperature and Response Format hidden — kept at defaults (0.0, json).
-        # Power users can edit config.json directly.
+        rows["response_format"] = make_block("Response format", "Output format for transcription results.")
+        ttk.Combobox(rows["response_format"], textvariable=fmt_var, values=RESPONSE_FORMATS, state="readonly", width=42).pack(fill="x", pady=(4, 0))
 
         make_card("Preferences")
         rows["hotkey"] = make_block("Record Hotkey", "Click Change, then press a special key such as PgDn, F-key, Home, or End.")
@@ -1286,7 +1286,8 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
                 model_var.set(saved_provider_models.get(provider.key, ""))
                 prev_provider_key[0] = provider.key
 
-            for key in local_keys + remote_keys:
+            all_dynamic = local_keys + remote_keys + ["response_format"]
+            for key in all_dynamic:
                 if key in rows:
                     rows[key].pack_forget()
 
@@ -1297,6 +1298,10 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
                 if needs_base_url:
                     visible.append("transcription_base_url")
                 place_rows_in_order(visible, provider_block)
+
+            has_response_format = provider.key in ("openai", "custom-openai-compatible")
+            if has_response_format:
+                rows["response_format"].pack(fill="x", pady=(8, 0))
 
             refresh_remote_model_suggestions()
             refresh_local_model_selection()
@@ -1876,12 +1881,166 @@ def on_hotkey(tray, update_tray):
             start_recording(tray, update_tray)
 
 
+def _detect_gpu():
+    """Detect available GPU acceleration."""
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return "nvidia", result.stdout.strip().split("\n")[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    if Path("/usr/share/vulkan/icd.d/radeon_icd.x86_64.json").exists():
+        return "vulkan-amd", "AMD GPU (Vulkan)"
+    if Path("/usr/share/vulkan/icd.d/intel_icd.x86_64.json").exists():
+        return "vulkan-intel", "Intel GPU (Vulkan)"
+    return None, None
+
+
+def _run_first_launch_wizard():
+    """Show a simple setup wizard on first launch. Returns config dict updates."""
+    gpu_type, gpu_name = _detect_gpu()
+    has_gpu = gpu_type is not None
+
+    root = tk.Tk()
+    root.title("Welcome to VibeMic")
+    root.configure(bg=BG)
+    root.resizable(False, False)
+    _apply_theme(root)
+
+    frame = tk.Frame(root, bg=BG, padx=32, pady=24)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(frame, text="Welcome to VibeMic", bg=BG, fg=FG,
+             font=("sans-serif", 18, "bold")).pack(anchor="w", pady=(0, 4))
+    tk.Label(frame, text="Press a hotkey, speak, text appears. Let's set up transcription.",
+             bg=BG, fg=SECONDARY, font=("sans-serif", 10)).pack(anchor="w", pady=(0, 16))
+
+    result = {"provider": None}
+
+    if has_gpu:
+        tk.Label(frame, text=f"GPU detected: {gpu_name}", bg=BG, fg=SUCCESS,
+                 font=("sans-serif", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        tk.Label(frame, text="Local transcription will be fast on your GPU. No internet needed.",
+                 bg=BG, fg=SECONDARY, font=("sans-serif", 9)).pack(anchor="w", pady=(0, 12))
+    else:
+        tk.Label(frame, text="No GPU detected — local transcription will be slow.",
+                 bg=BG, fg=WARNING, font=("sans-serif", 10)).pack(anchor="w", pady=(0, 8))
+        tk.Label(frame, text="Groq offers free cloud transcription (fast, 8 hours/day).",
+                 bg=BG, fg=SECONDARY, font=("sans-serif", 9)).pack(anchor="w", pady=(0, 12))
+
+    card = tk.Frame(frame, bg=CARD_BG, bd=0, highlightthickness=1, highlightbackground=BORDER, padx=20, pady=16)
+    card.pack(fill="x", pady=(0, 12))
+
+    tk.Label(card, text="Choose transcription backend:", bg=CARD_BG, fg=FG,
+             font=("sans-serif", 11, "bold")).pack(anchor="w", pady=(0, 8))
+
+    groq_desc = "Free, fast, needs internet. 8 hrs/day free tier." + (" (Recommended)" if not has_gpu else "")
+    local_desc = "Offline, private, needs model download (~500MB)." + (" (Recommended)" if has_gpu else " (Slow without GPU)")
+
+    def pick_groq():
+        result["provider"] = "groq"
+        root.destroy()
+
+    def pick_local():
+        result["provider"] = "local-whisper-cpp"
+        root.destroy()
+
+    groq_btn = ttk.Button(card, text=f"Groq Cloud — {groq_desc}", command=pick_groq,
+                           style="Accent.TButton" if not has_gpu else "TButton")
+    groq_btn.pack(fill="x", pady=(0, 6))
+
+    local_btn = ttk.Button(card, text=f"Local whisper.cpp — {local_desc}", command=pick_local,
+                            style="Accent.TButton" if has_gpu else "TButton")
+    local_btn.pack(fill="x")
+
+    root.update_idletasks()
+    root.geometry("520x320")
+    root.mainloop()
+
+    if result["provider"] is None:
+        return None
+
+    if result["provider"] == "groq":
+        return _groq_key_wizard()
+
+    return {
+        "transcription_provider": "local-whisper-cpp",
+        "local_whisper_binary_path": detect_local_whisper_binary() or "whisper-cli",
+        "local_whisper_model_path": str(LOCAL_MODEL_PRESETS[1].file_path),
+    }
+
+
+def _groq_key_wizard():
+    """Prompt user for Groq API key."""
+    root = tk.Tk()
+    root.title("Groq Setup")
+    root.configure(bg=BG)
+    root.resizable(False, False)
+    _apply_theme(root)
+
+    frame = tk.Frame(root, bg=BG, padx=32, pady=24)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(frame, text="Groq API Key", bg=BG, fg=FG,
+             font=("sans-serif", 16, "bold")).pack(anchor="w", pady=(0, 8))
+    tk.Label(frame, text="Get a free key from console.groq.com/keys",
+             bg=BG, fg=SECONDARY, font=("sans-serif", 10)).pack(anchor="w", pady=(0, 4))
+
+    def open_groq():
+        opener = shutil.which("xdg-open")
+        if opener:
+            subprocess.Popen([opener, "https://console.groq.com/keys"])
+
+    ttk.Button(frame, text="Open Groq Console in Browser", command=open_groq).pack(anchor="w", pady=(0, 12))
+
+    tk.Label(frame, text="Paste your key here:", bg=BG, fg=SECONDARY,
+             font=("sans-serif", 9, "bold")).pack(anchor="w", pady=(0, 4))
+    key_var = tk.StringVar()
+    ttk.Entry(frame, textvariable=key_var, width=50).pack(fill="x", pady=(0, 16))
+
+    result = {"key": None}
+
+    def save_key():
+        k = key_var.get().strip()
+        if k:
+            result["key"] = k
+            root.destroy()
+
+    ttk.Button(frame, text="Save & Start", command=save_key, style="Accent.TButton").pack(anchor="e")
+
+    root.update_idletasks()
+    root.geometry("480x240")
+    root.mainloop()
+
+    if not result["key"]:
+        return None
+
+    return {
+        "transcription_provider": "groq",
+        "model": "whisper-large-v3-turbo",
+        "provider_keys": {"groq": result["key"]},
+        "transcription_api_key": result["key"],
+        "api_key": result["key"],
+    }
+
+
 def main():
     global config
 
     import pystray
 
+    is_first_launch = not CONFIG_FILE.exists()
     config = load_config()
+
+    if is_first_launch:
+        _logger.info("First launch detected, running setup wizard")
+        wizard_result = _run_first_launch_wizard()
+        if wizard_result:
+            config.update(wizard_result)
+            save_config(config)
+            config = load_config()
+            _logger.info(f"Wizard complete: provider={config.get('transcription_provider')}")
 
     readiness_issue = transcription_readiness_issue(config)
     if readiness_issue:
