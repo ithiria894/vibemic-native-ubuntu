@@ -1882,18 +1882,15 @@ def on_hotkey(tray, update_tray):
 
 
 def _detect_gpu():
-    """Detect available GPU acceleration."""
+    """Detect usable GPU for whisper acceleration. Only NVIDIA discrete GPUs are fast enough."""
     try:
-        result = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                                 capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
-            return "nvidia", result.stdout.strip().split("\n")[0]
+            name = result.stdout.strip().split(",")[0].strip()
+            return "nvidia", name
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    if Path("/usr/share/vulkan/icd.d/radeon_icd.x86_64.json").exists():
-        return "vulkan-amd", "AMD GPU (Vulkan)"
-    if Path("/usr/share/vulkan/icd.d/intel_icd.x86_64.json").exists():
-        return "vulkan-intel", "Intel GPU (Vulkan)"
     return None, None
 
 
@@ -1936,7 +1933,7 @@ def _run_first_launch_wizard():
              font=("sans-serif", 11, "bold")).pack(anchor="w", pady=(0, 8))
 
     groq_desc = "Free, fast, needs internet. 8 hrs/day free tier." + (" (Recommended)" if not has_gpu else "")
-    local_desc = "Offline, private, needs model download (~500MB)." + (" (Recommended)" if has_gpu else " (Slow without GPU)")
+    local_desc = "Offline, private, needs model download (~500MB)." + (" (Recommended)" if has_gpu else " (Slow without NVIDIA GPU)")
 
     def pick_groq():
         result["provider"] = "groq"
