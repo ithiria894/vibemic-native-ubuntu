@@ -3,6 +3,7 @@
 
 import json
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -17,14 +18,16 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
 
 from openai import OpenAI
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 from pynput import keyboard
 try:
     from Xlib import X, XK, display as xdisplay
+    from Xlib.ext import shape
 except ImportError:
     X = None
     XK = None
     xdisplay = None
+    shape = None
 
 
 @dataclass(frozen=True)
@@ -541,13 +544,21 @@ def clear_history():
 config = load_config()
 recording_process = None
 is_recording = False
+current_state = "idle"
 state_lock = threading.Lock()
 RECORD_KEY = getattr(keyboard.Key, config.get("hotkey", "page_down"), keyboard.Key.page_down)
 
 
 def notify(title, message, icon="dialog-information"):
-    """Log to console only — no desktop notifications."""
     print(f"[{title}] {message}")
+    try:
+        subprocess.Popen(
+            ["notify-send", "-i", icon, title, message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
 
 
 def create_tray_icon(color):
@@ -749,6 +760,25 @@ def make_transcription_provider(current_config):
     if provider.key == "local-whisper-cpp":
         return LocalWhisperCppTranscriptionProvider()
     return OpenAICompatibleTranscriptionProvider()
+
+
+def _humanize_hotkey(key_name):
+    special = {
+        "page_down": "Page Down",
+        "page_up": "Page Up",
+        "home": "Home",
+        "end": "End",
+        "insert": "Insert",
+        "delete": "Delete",
+        "scroll_lock": "Scroll Lock",
+        "pause": "Pause",
+        "print_screen": "Print Screen",
+    }
+    if key_name in special:
+        return special[key_name]
+    if key_name and key_name.startswith("f") and key_name[1:].isdigit():
+        return key_name.upper()
+    return " ".join(part.capitalize() for part in (key_name or "").split("_")) or "Page Down"
 
 
 # ─── Native Settings Dialog ───
@@ -1397,6 +1427,240 @@ def open_history_dialog():
 
 
 # ─── Paraphrase ───
+class FloatingOverlay:
+    """Small centered pill overlay for recording/transcribing states."""
+
+    MASK_COLOR = "#010203"
+    TOP_MARGIN = 80
+    RECORDING_WIDTH = 140
+    STATUS_WIDTH = 140
+    HEIGHT = 44
+
+    def __init__(self, on_stop):
+        self.on_stop = on_stop
+        self._events = queue.Queue()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2)
+
+    def show_recording(self):
+        self._events.put(("recording",))
+
+    def show_status(self, text, fill):
+        self._events.put(("status", text, fill))
+
+    def hide(self):
+        self._events.put(("hide",))
+
+    def shutdown(self):
+        self._events.put(("shutdown",))
+
+    def _run(self):
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            print(f"Warning: overlay disabled: {exc}")
+            self._ready.set()
+            return
+
+        self.root = root
+        self.root.withdraw()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.98)
+        self._shape_display = None
+        self._shape_window = None
+
+        self._transparent_supported = False
+        self.root.configure(bg=self.MASK_COLOR)
+        try:
+            self.root.wm_attributes("-transparentcolor", self.MASK_COLOR)
+            self._transparent_supported = True
+        except tk.TclError:
+            pass
+        try:
+            self.root.wm_attributes("-type", "splash")
+        except tk.TclError:
+            pass
+
+        try:
+            self._shape_display = xdisplay.Display()
+        except Exception:
+            self._shape_display = None
+
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self._pulse_job = None
+        self._dot_state = False
+        self._current_mode = "idle"
+        self._bg_photo = None
+        self._button_photo = None
+        self._ready.set()
+
+        self.root.after(50, self._process_events)
+        self.root.mainloop()
+
+    def _process_events(self):
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = event[0]
+            if kind == "recording":
+                self._show_recording()
+            elif kind == "status":
+                self._show_status(event[1], event[2])
+            elif kind == "hide":
+                self._hide()
+            elif kind == "shutdown":
+                self._hide()
+                self.root.destroy()
+                return
+
+        self.root.after(50, self._process_events)
+
+    def _place_window(self, width, height):
+        screen_w = self.root.winfo_screenwidth()
+        x = max(0, (screen_w - width) // 2)
+        y = self.TOP_MARGIN
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _prepare(self, width, height, fill):
+        bg = self.MASK_COLOR if self._transparent_supported else fill
+        self.root.configure(bg=bg)
+        self.canvas.configure(width=width, height=height, bg=bg)
+        self.canvas.delete("all")
+        self._place_window(width, height)
+        self.root.update_idletasks()
+        self._apply_window_shape(width, height)
+        self.root.deiconify()
+        self.root.lift()
+        self._cancel_pulse()
+        self._bg_photo = self._render_capsule_photo(width, height, fill, border=self._mix(fill, "#ffffff", 0.18))
+        self.canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
+
+    def _show_recording(self):
+        width, height = self.RECORDING_WIDTH, self.HEIGHT
+        fill = "#e5484d"
+        self._current_mode = "recording"
+        self._prepare(width, height, fill)
+
+        self.dot_id = self.canvas.create_oval(14, 16, 26, 28, fill="#ffffff", outline="#ffffff")
+        self.canvas.create_text(32, height // 2, text="REC", fill="#ffffff", font=("Helvetica", 13, "bold"), anchor="w")
+
+        button_left = width - 60
+        button_right = width - 12
+        button_top = 9
+        button_bottom = height - 9
+        button_width = button_right - button_left
+        button_height = button_bottom - button_top
+        self._button_photo = self._render_capsule_photo(
+            button_width,
+            button_height,
+            "#ffffff",
+            border="#f2f2f5",
+        )
+        self.canvas.create_image(button_left, button_top, image=self._button_photo, anchor="nw", tags=("stop_button",))
+        self.canvas.create_text(
+            (button_left + button_right) // 2,
+            height // 2,
+            text="STOP",
+            fill=fill,
+            font=("Helvetica", 10, "bold"),
+            tags=("stop_button",),
+        )
+        self.canvas.tag_bind("stop_button", "<Button-1>", self._handle_stop)
+        self._pulse_dot()
+
+    def _show_status(self, text, fill):
+        width, height = self.STATUS_WIDTH, self.HEIGHT
+        self._current_mode = text.lower()
+        self._prepare(width, height, fill)
+        self.canvas.create_text(width // 2, height // 2, text=text, fill="#ffffff", font=("Helvetica", 12, "bold"))
+
+    def _hide(self):
+        self._current_mode = "idle"
+        self._cancel_pulse()
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+
+    def _handle_stop(self, _event):
+        threading.Thread(target=self.on_stop, daemon=True).start()
+
+    def _pulse_dot(self):
+        self._cancel_pulse()
+        if self._current_mode != "recording":
+            return
+        self._dot_state = not self._dot_state
+        self.canvas.itemconfig(self.dot_id, fill="#ffffff" if self._dot_state else "#ffd6d7", outline="#ffffff")
+        self._pulse_job = self.root.after(500, self._pulse_dot)
+
+    def _cancel_pulse(self):
+        if self._pulse_job is not None:
+            try:
+                self.root.after_cancel(self._pulse_job)
+            except tk.TclError:
+                pass
+            self._pulse_job = None
+
+    def _render_capsule_photo(self, width, height, fill, border=None):
+        scale = 4
+        image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        radius = (height * scale) // 2
+        draw.rounded_rectangle(
+            [0, 0, width * scale - 1, height * scale - 1],
+            radius=radius,
+            fill=fill,
+            outline=border or fill,
+            width=max(1, scale),
+        )
+        downsampled = image.resize((width, height), Image.LANCZOS)
+        return ImageTk.PhotoImage(downsampled)
+
+    def _mix(self, left, right, ratio):
+        def parse(color):
+            color = color.lstrip("#")
+            return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+        left_rgb = parse(left)
+        right_rgb = parse(right)
+        mixed = tuple(int(left_rgb[i] * (1 - ratio) + right_rgb[i] * ratio) for i in range(3))
+        return "#{:02x}{:02x}{:02x}".format(*mixed)
+
+    def _apply_window_shape(self, width, height):
+        if not self._shape_display:
+            return
+
+        try:
+            if self._shape_window is None:
+                self._shape_window = self._shape_display.create_resource_object("window", self.root.winfo_id())
+
+            radius = height / 2.0
+            center_y = (height - 1) / 2.0
+            rects = []
+            for y in range(height):
+                dy = abs(center_y - y)
+                inset = int(max(0, round(radius - max(0.0, radius * radius - dy * dy) ** 0.5)))
+                rect_width = max(1, width - (inset * 2))
+                rects.append((inset, y, rect_width, 1))
+
+            self._shape_window.shape_rectangles(shape.SO.Set, shape.SK.Bounding, 0, 0, 0, rects)
+            try:
+                self._shape_window.shape_rectangles(shape.SO.Set, shape.SK.Input, 0, 0, 0, rects)
+            except Exception:
+                pass
+            self._shape_display.flush()
+        except Exception:
+            pass
+
+
 def paraphrase_text(text, api_key, para_prompt, model="gpt-4o-mini"):
     """Use OpenAI chat completions to paraphrase the transcript."""
     client = OpenAI(api_key=api_key)
@@ -1498,12 +1762,21 @@ def stop_and_transcribe(tray, update_tray):
 
         save_to_history(text, original=original_text)
 
-        process = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
-        process.communicate(text.encode("utf-8"))
+        try:
+            process = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+            process.communicate(text.encode("utf-8"))
+        except FileNotFoundError:
+            notify("VibeMic", "xclip not found. Install: sudo apt install xclip", "dialog-error")
+            update_tray("idle")
+            return
 
         import time
         time.sleep(0.05)
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=5)
+
+        try:
+            subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=5)
+        except FileNotFoundError:
+            notify("VibeMic", "xdotool not found. Install: sudo apt install xdotool", "dialog-error")
 
         notify("VibeMic", f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}")
         update_tray("idle")
@@ -1548,7 +1821,7 @@ def main():
     if config.get("paraphrase_enabled") and not str(config.get("api_key", "")).strip():
         print("WARNING: Paraphrase is enabled but Default API Key is missing.")
 
-    if not any((Path(directory) / "sox").exists() for directory in os.environ.get("PATH", "").split(":")):
+    if not shutil.which("sox"):
         print("ERROR: sox not found. Install: sudo apt install sox libsox-fmt-all")
         sys.exit(1)
 
@@ -1561,17 +1834,41 @@ def main():
 
     tray = pystray.Icon("vibemic")
     tray.icon = icons["idle"]
-    tray.title = "VibeMic — Press PgDn to record"
+    tray.title = f"VibeMic — Press {_humanize_hotkey(config.get('hotkey', 'page_down'))} to record"
+
+    overlay_holder = {}
+
+    def stop_from_overlay():
+        on_hotkey(tray, update_tray)
+
+    overlay_holder["overlay"] = FloatingOverlay(stop_from_overlay)
 
     def update_tray(state):
+        global current_state
+        current_state = state
         tray.icon = icons.get(state, icons["idle"])
+        hotkey_label = _humanize_hotkey(config.get("hotkey", "page_down"))
         titles = {
-            "idle": "VibeMic — Press PgDn to record",
-            "recording": "VibeMic — Recording... PgDn to stop",
+            "idle": f"VibeMic — Press {hotkey_label} to record",
+            "recording": f"VibeMic — Recording... {hotkey_label} to stop",
             "transcribing": "VibeMic — Transcribing...",
             "paraphrasing": "VibeMic — Paraphrasing...",
         }
         tray.title = titles.get(state, titles["idle"])
+        overlay = overlay_holder.get("overlay")
+        if overlay:
+            if state == "recording":
+                overlay.show_recording()
+            elif state == "transcribing":
+                overlay.show_status("Transcribing", "#ff9f0a")
+            elif state == "paraphrasing":
+                overlay.show_status("Paraphrasing", "#8e6cff")
+            else:
+                overlay.hide()
+        try:
+            tray.update_menu()
+        except Exception:
+            pass
 
     def open_history_click(icon, item):
         del icon, item
@@ -1584,6 +1881,10 @@ def main():
         save_config(config)
         state = "ON" if config["paraphrase_enabled"] else "OFF"
         notify("VibeMic", f"Paraphrase mode {state}")
+        try:
+            tray.update_menu()
+        except Exception:
+            pass
 
     xdpy = None
     current_keycode = [None]
@@ -1626,6 +1927,7 @@ def main():
     def on_settings_save(new_config):
         global config
         config = normalize_config(new_config)
+        update_tray(current_state)
 
     def on_hotkey_change(new_key_name):
         global RECORD_KEY
@@ -1649,6 +1951,22 @@ def main():
         del icon, item
         open_settings_dialog(on_settings_save, on_hotkey_change)
 
+    def record_click(icon, item):
+        del icon, item
+        on_hotkey(tray, update_tray)
+
+    def record_label(item):
+        labels = {
+            "idle": "Record",
+            "recording": "Stop Recording",
+            "transcribing": "Transcribing...",
+            "paraphrasing": "Paraphrasing...",
+        }
+        return labels.get(current_state, "Record")
+
+    def record_enabled(item):
+        return current_state in {"idle", "recording"}
+
     def quit_app(icon, item):
         del item
         global recording_process
@@ -1656,15 +1974,25 @@ def main():
             recording_process.kill()
         if current_keycode[0] is not None:
             x11_ungrab(current_keycode[0])
+        overlay = overlay_holder.get("overlay")
+        if overlay:
+            overlay.shutdown()
         icon.stop()
 
     tray.menu = pystray.Menu(
         pystray.MenuItem("VibeMic", None, enabled=False),
-        pystray.MenuItem("📋  History", open_history_click),
-        pystray.MenuItem("⚙️  Settings...", open_settings_click),
-        pystray.MenuItem("✍️  Paraphrase", toggle_paraphrase, checked=lambda item: config.get("paraphrase_enabled", False)),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", quit_app),
+        pystray.MenuItem(record_label, record_click, enabled=record_enabled),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("History", open_history_click),
+        pystray.MenuItem("Settings...", open_settings_click),
+        pystray.MenuItem(
+            "Paraphrase",
+            toggle_paraphrase,
+            checked=lambda item: config.get("paraphrase_enabled", False),
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit VibeMic", quit_app),
     )
 
     def on_press(key):
