@@ -1271,7 +1271,9 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
                 previous = rows[key]
 
         def toggle_provider_rows():
-            provider = provider_spec_from_display(provider_var.get())
+            selected = provider_combo.get() or provider_var.get()
+            provider_var.set(selected)
+            provider = provider_spec_from_display(selected)
             is_local = provider.key == "local-whisper-cpp"
             needs_base_url = provider.key in ("litellm", "custom-openai-compatible")
             local_keys = ["local_binary_path", "local_model_preset", "local_model_path", "model_library"]
@@ -1324,7 +1326,7 @@ def open_settings_dialog(on_save=None, on_hotkey_change=None):
         button_row.pack(fill="x", pady=(16, 4))
 
         def do_save():
-            provider = provider_spec_from_display(provider_var.get())
+            provider = provider_spec_from_display(provider_combo.get() or provider_var.get())
             language_name = lang_var.get()
             language_code = next((code for name, code in LANGUAGES if name == language_name), "")
 
