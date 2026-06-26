@@ -3,3 +3,7 @@ config.json
 history.json
 __pycache__/
 *.pyc
+
+# local rollback backups (may contain secrets)
+*.bak
+*.bak.*

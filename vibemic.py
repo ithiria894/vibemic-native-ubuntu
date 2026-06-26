@@ -569,14 +569,6 @@ def notify(title, message, icon="dialog-information"):
     print(f"[{title}] {message}")
     level = logging.ERROR if "error" in icon else logging.INFO
     _logger.log(level, f"{title}: {message}")
-    try:
-        subprocess.Popen(
-            ["notify-send", "-i", icon, title, message],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        pass
 
 
 def create_tray_icon(color):
@@ -688,6 +680,101 @@ class TranscriberError(RuntimeError):
     """Domain-specific transcription failure."""
 
 
+# ─── Remote upload size handling (prevents 413 Request Entity Too Large) ───
+# Raw recording is 16 kHz mono 16-bit WAV ≈ 1.9 MB/min, so the provider's
+# 25 MB request cap is hit around 13 min. Compress to a small mono mp3 before
+# upload; if a marathon recording still exceeds the cap, split into chunks.
+REMOTE_UPLOAD_LIMIT_BYTES = 24 * 1024 * 1024  # 24 MB safety margin under 25 MB
+COMPRESSED_AUDIO_BITRATE = "32k"  # 16 kHz mono mp3 ≈ 4 KB/s → 24 MB ≈ 100 min
+
+
+def _audio_duration_seconds(file_path):
+    """Best-effort audio duration via ffprobe. Returns 0.0 if unavailable."""
+    if not shutil.which("ffprobe"):
+        return 0.0
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(file_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float((result.stdout or "").strip() or 0)
+    except (ValueError, subprocess.SubprocessError, OSError) as exc:
+        _logger.warning("VibeMic: ffprobe duration failed for %s: %s", file_path, exc)
+        return 0.0
+
+
+def compress_audio_for_upload(file_path):
+    """Compress audio to a small mono mp3 for remote upload.
+
+    Returns (upload_path, cleanup_paths). Falls back to the original file
+    (and an empty cleanup list) if ffmpeg is missing or compression fails,
+    so transcription still proceeds rather than hard-failing.
+    """
+    src = str(file_path)
+    src_size = os.path.getsize(src) if os.path.exists(src) else 0
+    if not shutil.which("ffmpeg"):
+        _logger.warning("VibeMic: ffmpeg not found, uploading raw audio (%d B). "
+                        "Long recordings may hit the 25 MB limit.", src_size)
+        return src, []
+
+    dst = str(TEMP_DIR / f"upload-{os.getpid()}.mp3")
+    cmd = ["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000",
+           "-b:a", COMPRESSED_AUDIO_BITRATE, "-f", "mp3", dst]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _logger.warning("VibeMic: audio compression errored (%s), uploading raw audio", exc)
+        return src, []
+
+    if result.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        _logger.warning("VibeMic: audio compression failed (rc=%s), uploading raw audio. %s",
+                        result.returncode, (result.stderr or "")[:200])
+        return src, []
+
+    dst_size = os.path.getsize(dst)
+    _logger.info("VibeMic: compressed audio %d B -> %d B (%.1fx smaller)",
+                 src_size, dst_size, (src_size / dst_size) if dst_size else 0)
+    return dst, [dst]
+
+
+def split_audio_into_chunks(file_path, limit_bytes):
+    """Split an audio file into time segments each safely under limit_bytes.
+
+    Returns (chunk_paths, chunk_dir). On failure returns ([file_path], None)
+    so the caller still attempts a single upload.
+    """
+    total = os.path.getsize(file_path)
+    duration = _audio_duration_seconds(file_path)
+    if duration <= 0:
+        _logger.warning("VibeMic: unknown audio duration, cannot chunk %s", file_path)
+        return [str(file_path)], None
+
+    bytes_per_sec = total / duration
+    seg_seconds = max(30, int((limit_bytes * 0.85) / bytes_per_sec))  # 15% headroom
+    chunk_dir = tempfile.mkdtemp(prefix="vibemic-chunks-", dir=str(TEMP_DIR))
+    pattern = os.path.join(chunk_dir, "chunk-%03d.mp3")
+    cmd = ["ffmpeg", "-y", "-i", str(file_path), "-f", "segment",
+           "-segment_time", str(seg_seconds), "-c", "copy", pattern]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _logger.warning("VibeMic: audio split errored (%s), uploading whole file", exc)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return [str(file_path)], None
+
+    chunks = sorted(str(p) for p in Path(chunk_dir).glob("chunk-*.mp3"))
+    if result.returncode != 0 or not chunks:
+        _logger.warning("VibeMic: audio split produced no chunks (rc=%s), uploading whole file. %s",
+                        result.returncode, (result.stderr or "")[:200])
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return [str(file_path)], None
+
+    _logger.info("VibeMic: split %d B audio into %d chunks of ~%ds each",
+                 total, len(chunks), seg_seconds)
+    return chunks, chunk_dir
+
+
 class TranscriptionProvider:
     """Simple provider protocol."""
 
@@ -709,6 +796,38 @@ class OpenAICompatibleTranscriptionProvider(TranscriptionProvider):
 
         client = OpenAI(api_key=api_key, base_url=base_url)
 
+        # Compress before upload so long recordings don't trip the provider's
+        # 25 MB request limit (the cause of past 413 errors).
+        upload_path, cleanup_paths = compress_audio_for_upload(file_path)
+        chunk_dir = None
+        try:
+            if os.path.getsize(upload_path) > REMOTE_UPLOAD_LIMIT_BYTES:
+                segments, chunk_dir = split_audio_into_chunks(upload_path, REMOTE_UPLOAD_LIMIT_BYTES)
+            else:
+                segments = [upload_path]
+
+            parts = []
+            for index, segment in enumerate(segments):
+                _logger.info("VibeMic: transcribing segment %d/%d (%d B): %s",
+                             index + 1, len(segments), os.path.getsize(segment), segment)
+                parts.append(self._transcribe_segment(client, segment, current_config))
+
+            text = " ".join(part for part in parts if part).strip()
+        finally:
+            for path in cleanup_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if chunk_dir:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+
+        if not text:
+            raise TranscriberError("No speech detected.")
+        return text
+
+    def _transcribe_segment(self, client, file_path, current_config):
+        """Send a single (already size-checked) audio file to the provider."""
         with open(file_path, "rb") as audio_file:
             params = {
                 "file": audio_file,
@@ -730,10 +849,7 @@ class OpenAICompatibleTranscriptionProvider(TranscriptionProvider):
 
             transcription = client.audio.transcriptions.create(**params)
 
-        text = extract_transcription_text(transcription)
-        if not text:
-            raise TranscriberError("No speech detected.")
-        return text
+        return extract_transcription_text(transcription) or ""
 
 
 class LocalWhisperCppTranscriptionProvider(TranscriptionProvider):
